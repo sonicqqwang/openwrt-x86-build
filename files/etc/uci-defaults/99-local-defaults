@@ -1,0 +1,18 @@
+#!/bin/sh
+# No passwords or subscription URLs are embedded in this image.
+uci set system.@system[0].hostname='OpenWrt'
+uci set system.@system[0].timezone='CST-8'
+uci set system.@system[0].zonename='Asia/Shanghai'
+uci commit system
+
+# Keep management services on the LAN.
+uci -q set dropbear.@dropbear[0].Interface='lan'
+uci commit dropbear
+
+# A custom build has no corresponding official kernel/package repository.
+# Retain the generated list as a reference, but do not advertise it as usable.
+if [ -f /etc/opkg/distfeeds.conf ]; then
+	cp /etc/opkg/distfeeds.conf /etc/opkg/distfeeds.conf.build-reference
+	sed -i 's/^src\//# src\//' /etc/opkg/distfeeds.conf
+fi
+exit 0

@@ -1,0 +1,175 @@
+name: Build OpenWrt x86_64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-openwrt.yml
+      - config/**
+      - files/**
+      - scripts/**
+      - sources.env
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openwrt-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      BUILD_ROOT: /mnt/openwrt-build
+      TZ: UTC
+      DEBIAN_FRONTEND: noninteractive
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout build configuration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare disposable runner
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/diagnostics" "$GITHUB_WORKSPACE/output"
+          # Only remove unused SDKs on this disposable GitHub-hosted VM.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo rm -rf /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl \
+            device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+            genisoimage git gperf help2man intltool libc6-dev-i386 libelf-dev \
+            libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev llvm libnsl-dev ninja-build p7zip-full patch \
+            pkgconf python3 python3-pyelftools python3-setuptools \
+            qemu-utils rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip upx-ucl wget xsltproc xmlto xxd xz-utils zlib1g-dev zstd
+          sudo apt-get clean
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /mnt
+          df -h | tee "$GITHUB_WORKSPACE/diagnostics/disk-before.txt"
+          available_kb=$(df -Pk /mnt | awk 'NR==2 {print $4}')
+          if (( available_kb < 35 * 1024 * 1024 )); then
+            echo 'Less than 35 GiB available; stopping before the build.' >&2
+            exit 1
+          fi
+
+      - name: Fetch pinned sources and resolve configuration
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          bash scripts/prepare.sh "$BUILD_ROOT" 2>&1 | tee diagnostics/prepare.log
+          cp "$BUILD_ROOT/.config" diagnostics/resolved.config
+          cp "$BUILD_ROOT/build-sources.txt" "$BUILD_ROOT/build-diffconfig.txt" diagnostics/
+
+      - name: Download source dependencies
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          cd "$BUILD_ROOT"
+          if ! make download -j8 V=s > "$GITHUB_WORKSPACE/diagnostics/download.log" 2>&1; then
+            tail -n 80 "$GITHUB_WORKSPACE/diagnostics/download.log"
+            make download -j2 V=s >> "$GITHUB_WORKSPACE/diagnostics/download.log" 2>&1
+          fi
+          tail -n 30 "$GITHUB_WORKSPACE/diagnostics/download.log"
+
+      - name: Compile firmware
+        timeout-minutes: 245
+        run: |
+          set -euo pipefail
+          cd "$BUILD_ROOT"
+          jobs=$(nproc)
+          (( jobs <= 4 )) || jobs=4
+          echo "Building with $jobs parallel jobs. Detailed logs will be uploaded."
+          monitor_build() {
+            while :; do
+              sleep 45
+              date -u
+              df -h "$BUILD_ROOT"
+              tail -n 8 "$GITHUB_WORKSPACE/diagnostics/build.log" || true
+            done
+          }
+          monitor_build &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid" 2>/dev/null || true' EXIT
+          if ! make -j"$jobs" V=s > "$GITHUB_WORKSPACE/diagnostics/build.log" 2>&1; then
+            tail -n 120 "$GITHUB_WORKSPACE/diagnostics/build.log"
+            echo 'Parallel build failed; retrying once with one job for a precise error.'
+            if ! make -j1 V=s >> "$GITHUB_WORKSPACE/diagnostics/build.log" 2>&1; then
+              tail -n 160 "$GITHUB_WORKSPACE/diagnostics/build.log"
+              exit 1
+            fi
+          fi
+
+      - name: Validate and collect firmware
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          target_dir="$BUILD_ROOT/bin/targets/x86/64"
+          images=("$target_dir"/*squashfs-combined-efi.img.gz)
+          manifests=("$target_dir"/*.manifest)
+          (( ${#images[@]} == 1 )) || { echo 'Expected exactly one UEFI SquashFS image.'; exit 1; }
+          (( ${#manifests[@]} >= 1 )) || { echo 'Package manifest is missing.'; exit 1; }
+          gzip -t "${images[0]}"
+          for package in luci-app-ssr-plus xray-core mihomo shadowsocksr-libev-ssr-redir firewall4; do
+            grep -h -E "^${package}[[:space:]]" "${manifests[@]}" >/dev/null || {
+              echo "Firmware is missing required package: $package" >&2
+              exit 1
+            }
+          done
+          cp "${images[0]}" "${manifests[@]}" output/
+          cp "$BUILD_ROOT/build-sources.txt" "$BUILD_ROOT/build-diffconfig.txt" output/
+          cp "$BUILD_ROOT/.config" output/build.config
+          cp README.md output/READ-BEFORE-FLASHING.md
+          (
+            cd output
+            sha256sum -- *.img.gz > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          {
+            echo '### Firmware built; hardware testing is still required'
+            echo 'Download the firmware artifact. No router was flashed.'
+            echo 'Keep the existing boot disk until network and proxy tests pass.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: firmware-x86_64-uefi-${{ github.run_number }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          mkdir -p diagnostics
+          df -h > diagnostics/disk-after.txt
+          if [ -f "$BUILD_ROOT/.config" ]; then
+            cp "$BUILD_ROOT/.config" diagnostics/resolved.config
+          fi
+          if [ -d "$BUILD_ROOT/logs" ]; then
+            cp -a "$BUILD_ROOT/logs" diagnostics/package-logs
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-diagnostics-${{ github.run_number }}
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
