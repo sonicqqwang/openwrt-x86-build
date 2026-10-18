@@ -122,7 +122,9 @@ jobs:
           manifests=("$target_dir"/*.manifest)
           (( ${#images[@]} == 1 )) || { echo 'Expected exactly one UEFI SquashFS image.'; exit 1; }
           (( ${#manifests[@]} >= 1 )) || { echo 'Package manifest is missing.'; exit 1; }
-          gzip -t "${images[0]}"
+          fwtool="$BUILD_ROOT/staging_dir/host/bin/fwtool"
+          python3 scripts/test_validate_image.py "$fwtool"
+          bash scripts/validate-image.sh "$fwtool" "${images[0]}" output/firmware-metadata.json
           for package in luci-app-ssr-plus xray-core mihomo shadowsocksr-libev-ssr-redir firewall4; do
             grep -h -E "^${package}[[:space:]]" "${manifests[@]}" >/dev/null || {
               echo "Firmware is missing required package: $package" >&2
