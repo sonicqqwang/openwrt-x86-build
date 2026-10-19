@@ -28,6 +28,13 @@ class ImageValidationTests(unittest.TestCase):
     def append_metadata(self):
         subprocess.run([FWTOOL, "-I", str(self.metadata), str(self.image)], check=True)
 
+    def append_signature(self):
+        # fwtool treats the signature as opaque bytes; these tests check trailer
+        # framing/CRC, not a cryptographic signature's authenticity.
+        signature = self.root / "signature"
+        signature.write_bytes(b"signature trailer fixture")
+        subprocess.run([FWTOOL, "-S", str(signature), str(self.image)], check=True)
+
     def validate(self, expected_success):
         before = hashlib.sha256(self.image.read_bytes()).digest()
         result = subprocess.run(
@@ -43,9 +50,55 @@ class ImageValidationTests(unittest.TestCase):
         old = subprocess.run(["gzip", "-t", str(self.image)], capture_output=True)
         self.assertEqual(old.returncode, 2)
         self.validate(True)
-        self.assertEqual(json.loads(self.output.read_text()), json.loads(self.metadata.read_text()))
+        self.assertEqual(json.loads(self.output.read_text())["metadata"], json.loads(self.metadata.read_text()))
 
-    def test_missing_metadata_is_rejected(self):
+    def test_plain_gzip_is_accepted(self):
+        self.validate(True)
+
+    def test_signature_only_x86_image_is_accepted(self):
+        self.append_signature()
+        self.validate(True)
+        report = json.loads(self.output.read_text())
+        self.assertTrue(report["signature_present"])
+        self.assertIsNone(report["metadata"])
+
+    def test_metadata_and_signature_are_accepted(self):
+        self.append_metadata()
+        self.append_signature()
+        self.validate(True)
+
+    def test_small_signed_image_is_accepted(self):
+        self.image.write_bytes(gzip.compress(b"small fixture"))
+        self.append_signature()
+        self.validate(True)
+
+    def test_bad_gzip_crc_with_signature_is_rejected(self):
+        broken = bytearray(self.payload)
+        broken[-8] ^= 1
+        self.image.write_bytes(broken)
+        self.append_signature()
+        self.validate(False)
+
+    def test_damaged_signature_trailer_is_rejected(self):
+        self.append_signature()
+        broken = bytearray(self.image.read_bytes())
+        broken[-17] ^= 1
+        self.image.write_bytes(broken)
+        self.validate(False)
+
+    def test_truncated_signature_trailer_is_rejected(self):
+        self.append_signature()
+        self.image.write_bytes(self.image.read_bytes()[:-5])
+        self.validate(False)
+
+    def test_garbage_before_valid_signature_is_rejected(self):
+        self.image.write_bytes(self.payload + b"garbage")
+        self.append_signature()
+        self.validate(False)
+
+    def test_duplicate_signature_is_rejected(self):
+        self.append_signature()
+        self.append_signature()
         self.validate(False)
 
     def test_truncated_gzip_with_valid_metadata_is_rejected(self):

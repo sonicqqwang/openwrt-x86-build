@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
-# x86 .img.gz images have fwtool metadata appended AFTER the gzip stream.
-# Validate its CRC and test the extracted gzip stream without changing the image.
+# Validate gzip images with optional fwtool signature and metadata trailers.
 set -euo pipefail
 if (( $# != 3 )); then
-  echo "Usage: $0 FWTOOL IMAGE METADATA_OUTPUT" >&2
+  echo "Usage: $0 FWTOOL IMAGE REPORT_OUTPUT" >&2
   exit 2
 fi
-fwtool=$1
-image=$2
-metadata=$3
-"$fwtool" -i "$metadata" -T "$image" | gzip -t
-python3 -m json.tool "$metadata" >/dev/null
+exec python3 "$(dirname -- "$0")/validate_image.py" "$@"

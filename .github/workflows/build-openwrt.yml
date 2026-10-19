@@ -85,6 +85,7 @@ jobs:
           tail -n 30 "$GITHUB_WORKSPACE/diagnostics/download.log"
 
       - name: Compile firmware
+        id: compile
         timeout-minutes: 245
         run: |
           set -euo pipefail
@@ -124,7 +125,7 @@ jobs:
           (( ${#manifests[@]} >= 1 )) || { echo 'Package manifest is missing.'; exit 1; }
           fwtool="$BUILD_ROOT/staging_dir/host/bin/fwtool"
           python3 scripts/test_validate_image.py "$fwtool"
-          bash scripts/validate-image.sh "$fwtool" "${images[0]}" output/firmware-metadata.json
+          bash scripts/validate-image.sh "$fwtool" "${images[0]}" output/firmware-validation.json
           for package in luci-app-ssr-plus xray-core mihomo shadowsocksr-libev-ssr-redir firewall4; do
             grep -h -E "^${package}[[:space:]]" "${manifests[@]}" >/dev/null || {
               echo "Firmware is missing required package: $package" >&2
@@ -166,6 +167,25 @@ jobs:
           if [ -d "$BUILD_ROOT/logs" ]; then
             cp -a "$BUILD_ROOT/logs" diagnostics/package-logs
           fi
+
+      - name: Preserve candidate for debugging if validation or upload fails
+        if: failure() && steps.compile.outcome == 'success'
+        run: |
+          set -euo pipefail
+          mkdir -p unvalidated
+          cp "$BUILD_ROOT"/bin/targets/x86/64/*squashfs-combined-efi.img.gz unvalidated/
+          cp "$BUILD_ROOT"/bin/targets/x86/64/*.manifest unvalidated/
+          printf '%s\n' 'UNVALIDATED BUILD: for debugging only. Do not flash.' > unvalidated/DO-NOT-FLASH.txt
+
+      - name: Upload unvalidated candidate for debugging
+        if: failure() && steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: UNVALIDATED-DO-NOT-FLASH-${{ github.run_number }}
+          path: unvalidated/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
 
       - name: Upload diagnostics
         if: always()
